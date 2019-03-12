@@ -9,9 +9,11 @@
 #define INT64_C(val) val##i64
 extern "C" {
 #include "libavutil/mathematics.h"
+#include "libavutil/opt.h"
 #include "libavformat/avformat.h"
 #include "libavcodec/avcodec.h"
 #include "libswscale/swscale.h"
+#include "libavresample/avresample.h"
 }
 
 #define STREAM_FRAME_RATE 25 /* 25 images/s */
@@ -39,7 +41,12 @@ struct {
 	int video_outbuf_size;
 	int audio_input_frame_size;
 	int samples_used;
-	int16_t *samples;
+	int16_t *samples[AV_NUM_DATA_POINTERS];
+	int samples_size[AV_NUM_DATA_POINTERS];
+	uint8_t *samplescodec[AV_NUM_DATA_POINTERS];
+	int samplescodec_size[AV_NUM_DATA_POINTERS];
+	AVAudioResampleContext *acontext;
+	int64_t audio_duration;
 } videofile;
 
 void set_default_parameters()
@@ -149,7 +156,7 @@ void clear_picture(AVFrame *picture)
 	for (int n = 0; n < 8; n++)
 	{
 		if ((picture->data[n] != NULL) && (picture->linesize[n] != 0))
-			memset(picture->data[n], 0, picture->linesize[n] * picture->height);
+			memset(picture->data[n], 64, picture->linesize[n] * picture->height);
 		else
 			break;
 	}
@@ -162,6 +169,7 @@ void write_audio_frame(AVFormatContext *oc, AVStream *st, void *asamples, int co
 	AVFrame *frame = av_frame_alloc();
 	int got_packet;
 	uint16_t *audsamples;
+	int num;
 
 	audsamples = (uint16_t *)asamples;
 	av_init_packet(&pkt);
@@ -170,17 +178,20 @@ void write_audio_frame(AVFormatContext *oc, AVStream *st, void *asamples, int co
 	while (count > 0) {
 		// fill samples buffer until it has audio_input_frame_size samples
 		while ((videofile.samples_used < videofile.audio_input_frame_size) && (count > 0)) {
-			videofile.samples[videofile.samples_used] = *audsamples;
+			videofile.samples[0][videofile.samples_used] = *audsamples;
 			videofile.samples_used++;
 			audsamples++;
 			count--;
 		}
 		//get_audio_frame(samples, audio_input_frame_size, c->channels);
 		if (videofile.samples_used == videofile.audio_input_frame_size) {
+			// convert the samples
+			num = avresample_convert(videofile.acontext, videofile.samplescodec, 0, videofile.audio_input_frame_size, (uint8_t **)videofile.samples, 0, videofile.audio_input_frame_size);
+
 			videofile.samples_used = 0;
 			frame->nb_samples = videofile.audio_input_frame_size;
 			avcodec_fill_audio_frame(frame, c->channels, c->sample_fmt,
-				(uint8_t *)videofile.samples,
+				videofile.samplescodec[0],
 				videofile.audio_input_frame_size *
 				av_get_bytes_per_sample(c->sample_fmt) *
 				c->channels, 1);
@@ -191,8 +202,13 @@ void write_audio_frame(AVFormatContext *oc, AVStream *st, void *asamples, int co
 
 				if (pkt.pts != AV_NOPTS_VALUE)
 					pkt.pts = av_rescale_q(pkt.pts, st->codec->time_base, st->time_base);
+				else
+					pkt.pts = av_rescale_q(videofile.audio_duration, st->codec->time_base, st->time_base);
 				if (pkt.duration > 0)
+				{
+					videofile.audio_duration += pkt.duration;
 					pkt.duration = (int)av_rescale_q(pkt.duration, st->codec->time_base, st->time_base);
+				}
 
 				/* Write the compressed frame to the media file. */
 				if (av_interleaved_write_frame(oc, &pkt) != 0) {
@@ -278,8 +294,10 @@ void open_audio(AVFormatContext *oc, AVStream *st)
 		videofile.audio_input_frame_size = 10000;
 	else
 		videofile.audio_input_frame_size = c->frame_size;
-	videofile.samples = (int16_t *)av_malloc(videofile.audio_input_frame_size * av_get_bytes_per_sample(c->sample_fmt) * c->channels);
+	av_samples_alloc((uint8_t **)videofile.samples, videofile.samples_size, c->channels, videofile.audio_input_frame_size, AV_SAMPLE_FMT_S16, 0);
+	av_samples_alloc(videofile.samplescodec, videofile.samplescodec_size, c->channels, videofile.audio_input_frame_size, c->sample_fmt, 0);
 	videofile.samples_used = 0;
+	videofile.audio_duration = 0;
 }
 
 static void open_video(AVFormatContext *oc, AVStream *st)
@@ -330,7 +348,16 @@ AVStream *add_audio_stream(AVFormatContext *oc, AVCodecID codec_id)
 	c = st->codec;
 
 	/* put sample parameters */
-	c->sample_fmt = AV_SAMPLE_FMT_S16;
+	/* AAC supports only AV_SAMPLE_FMT_FLTP */
+	c->sample_fmt = codec->sample_fmts[0];
+	for (int n = 0; codec->sample_fmts[n] != -1; n++)
+	{
+		if (codec->sample_fmts[n] == AV_SAMPLE_FMT_S16)
+		{
+			c->sample_fmt = AV_SAMPLE_FMT_S16;
+			break;
+		}
+	}
 	c->bit_rate = 64000;
 	c->sample_rate = AUDIO_SAMPLE_RATE;
 	c->channels = 1;
@@ -339,6 +366,24 @@ AVStream *add_audio_stream(AVFormatContext *oc, AVCodecID codec_id)
 	// some formats want stream headers to be separate
 	if (oc->oformat->flags & AVFMT_GLOBALHEADER)
 		c->flags |= CODEC_FLAG_GLOBAL_HEADER;
+
+	videofile.acontext = avresample_alloc_context();
+
+	if (videofile.acontext)
+	{
+		av_opt_set_int(videofile.acontext, "in_channel_layout", AV_CH_LAYOUT_MONO, 0);
+		av_opt_set_int(videofile.acontext, "out_channel_layout", AV_CH_LAYOUT_MONO, 0);
+		av_opt_set_int(videofile.acontext, "in_sample_rate", AUDIO_SAMPLE_RATE, 0);
+		av_opt_set_int(videofile.acontext, "out_sample_rate", AUDIO_SAMPLE_RATE, 0);
+		av_opt_set_int(videofile.acontext, "in_sample_fmt", AV_SAMPLE_FMT_S16, 0);
+		av_opt_set_int(videofile.acontext, "out_sample_fmt", c->sample_fmt, 0);
+
+		if (avresample_open(videofile.acontext) < 0)
+		{
+			avresample_free(&videofile.acontext);
+			videofile.acontext = nullptr;
+		}
+	}
 
 	return st;
 }
@@ -395,10 +440,77 @@ AVStream *add_video_stream(AVFormatContext *oc, AVCodecID codec_id, int width, i
 	return st;
 }
 
+void flush_audio_codec(AVFormatContext *oc, AVStream *st)
+{
+	AVCodecContext *c;
+	int got_packet;
+
+	c = st->codec;
+
+	while (true)
+	{
+		AVPacket pkt = { 0 };
+
+		av_init_packet(&pkt);
+		avcodec_encode_audio2(c, &pkt, NULL, &got_packet);
+		if (got_packet == 0)
+			return;
+
+		pkt.stream_index = st->index;
+		if (pkt.pts != AV_NOPTS_VALUE)
+			pkt.pts = av_rescale_q(pkt.pts, st->codec->time_base, st->time_base);
+		else
+			pkt.pts = av_rescale_q(videofile.audio_duration, st->codec->time_base, st->time_base);
+		if (pkt.duration > 0)
+		{
+			videofile.audio_duration += pkt.duration;
+			pkt.duration = (int)av_rescale_q(pkt.duration, st->codec->time_base, st->time_base);
+		}
+
+		/* Write the compressed frame to the media file. */
+		if (av_interleaved_write_frame(oc, &pkt) != 0) {
+			fprintf(stderr, "Error while writing audio frame\n");
+			exit(1);
+		}
+		av_free_packet(&pkt);
+	}
+}
+
+void flush_video_codec(AVFormatContext *oc, AVStream *st)
+{
+	int ret;
+	AVCodecContext *c;
+	int got_packet;
+
+	c = st->codec;
+
+	while (true)
+	{
+		AVPacket pkt = { 0 };
+
+		ret = avcodec_encode_video2(c, &pkt, NULL, &got_packet);
+		if (got_packet == 0)
+			break;
+		if (c->coded_frame->key_frame)
+			pkt.flags |= AV_PKT_FLAG_KEY;
+		pkt.stream_index = st->index;
+
+		/* Write the compressed frame to the media file. */
+		ret = av_interleaved_write_frame(oc, &pkt);
+		av_free_packet(&pkt);
+	}
+}
+
 void close_audio(AVFormatContext *oc, AVStream *st)
 {
+	if (videofile.acontext)
+	{
+		avresample_close(videofile.acontext);
+		avresample_free(&videofile.acontext);
+	}
 	avcodec_close(st->codec);
-	av_free(videofile.samples);
+	av_freep(videofile.samples);
+	av_freep(videofile.samplescodec);
 }
 
 void close_video(AVFormatContext *oc, AVStream *st)
@@ -432,8 +544,9 @@ int open_video_file(char *filename, int width, int height)
 
 	/* Add the audio and video streams using the default format codecs
 	* and initialize the codecs. */
-	videofile.fmt->audio_codec = AV_CODEC_ID_AAC;
-	videofile.fmt->video_codec = AV_CODEC_ID_H264;
+	/* Not needed with libav 12 */
+	//videofile.fmt->audio_codec = AV_CODEC_ID_AAC;
+	//videofile.fmt->video_codec = AV_CODEC_ID_H264;
 
 	videofile.video_st = NULL;
 	videofile.audio_st = NULL;
@@ -469,6 +582,16 @@ int open_video_file(char *filename, int width, int height)
 int close_video_file()
 {
 	unsigned int i;
+
+	/* Flush any codec data not written to file */
+	if (videofile.video_st)
+	{
+		flush_video_codec(videofile.oc, videofile.video_st);
+	}
+	if (videofile.audio_st)
+	{
+		flush_audio_codec(videofile.oc, videofile.audio_st);
+	}
 
 	/* Write the trailer, if any. The trailer must be written before you
 	* close the CodecContexts open when you wrote the header; otherwise
