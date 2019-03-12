@@ -24,12 +24,21 @@
     <ClInclude Include="targetver.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="caratteri_120.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="caratteri.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="stdafx.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="rtmptester.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="caratteri.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
