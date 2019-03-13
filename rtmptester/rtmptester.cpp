@@ -3,8 +3,6 @@
 
 #include "stdafx.h"
 #include "caratteri.h"
-//#include "Strmif.h"
-//#include "Codecapi.h"
 #define UINT64_C(val) val##ui64
 #define INT64_C(val) val##i64
 extern "C" {
@@ -23,6 +21,7 @@ struct {
 	char *filename;
 	char *url;
 	int minutes;
+	bool realtime;
 } parameters;
 
 struct {
@@ -56,6 +55,7 @@ void set_default_parameters()
 	parameters.url = new char[8];
 	strcpy_s(parameters.url, 8, "rtmp://");
 	parameters.minutes = 1;
+	parameters.realtime = false;
 }
 
 void debug_list_codecs()
@@ -628,6 +628,11 @@ int close_video_file()
 
 int main(int argc, char *argv[])
 {
+	LARGE_INTEGER performance_frequency;
+	LARGE_INTEGER start_time;
+	LARGE_INTEGER end_time;
+	int timems;
+	int n;
 	uint16_t *audio_silent;
 
 	set_default_parameters();
@@ -644,6 +649,7 @@ int main(int argc, char *argv[])
 				printf("\t-f filename\t set mp4 output file name\n\r");
 				printf("\t-s url\t\t set rtmp server url\n\r");
 				printf("\t-m minutes\t set output duration in minutes\n\r");
+				printf("\t-r\t\t work in real time\n\r");
 				exit(0);
 			}
 			else if (strcmp(argv[n], "-f") == 0)
@@ -670,6 +676,10 @@ int main(int argc, char *argv[])
 					parameters.minutes = atoi(argv[n]);
 				}
 			}
+			else if (strcmp(argv[n], "-r") == 0)
+			{
+				parameters.realtime = true;
+			}
 			else
 			{
 				printf("Unknown option %s\n\r", argv[n]);
@@ -677,6 +687,7 @@ int main(int argc, char *argv[])
 			}
 		}
 	}
+	QueryPerformanceFrequency(&performance_frequency);
 	/* Initialize libavcodec, and register all codecs and formats. */
 	av_register_all();
 #ifdef _DEBUG
@@ -690,8 +701,10 @@ int main(int argc, char *argv[])
 	{
 		audio_silent = new uint16_t[AUDIO_SAMPLE_RATE / STREAM_FRAME_RATE];
 		memset(audio_silent, 0, 2 * AUDIO_SAMPLE_RATE / STREAM_FRAME_RATE);
-		for (int n = 0; n < parameters.minutes * 60 * STREAM_FRAME_RATE; n++)
+		QueryPerformanceCounter(&start_time);
+		for (n = 0; n < parameters.minutes * 60 * STREAM_FRAME_RATE; n++)
 		{
+			LARGE_INTEGER current_time;
 			int x;
 
 			clear_picture(pics.generated);
@@ -699,8 +712,18 @@ int main(int argc, char *argv[])
 			value_draw_argb(pics.generated->data[0], x, 253, pics.generated->linesize[0], n);
 			write_video_frame(videofile.oc, videofile.video_st);
 			write_audio_frame(videofile.oc, videofile.audio_st, audio_silent, AUDIO_SAMPLE_RATE / STREAM_FRAME_RATE);
+			if (parameters.realtime)
+			{
+				QueryPerformanceCounter(&current_time);
+				timems = (int)(((current_time.QuadPart - start_time.QuadPart) * (LONGLONG)1000) / performance_frequency.QuadPart);
+				timems = ((n + 1) * 1000) / STREAM_FRAME_RATE - timems;
+				Sleep(timems);
+			}
 		}
+		QueryPerformanceCounter(&end_time);
 		close_video_file();
+		timems = (int)(((end_time.QuadPart - start_time.QuadPart) * (LONGLONG)1000) / performance_frequency.QuadPart);
+		printf("Generating %d frames took %d msec (%d sec)\n\r", n, timems, timems / 1000);
 	}
 	return 0;
 }

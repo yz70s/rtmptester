@@ -12,5 +12,6 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <Windows.h>
 
 // TODO: reference additional headers your program requires here
