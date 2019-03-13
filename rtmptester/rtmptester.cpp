@@ -80,13 +80,15 @@ void debug_list_formats()
 	}
 }
 
-/* Notes to convert from older versions to version 12
+/* Notes to convert from older versions to version 12 of libav
 	PixelFormat -> AVPixelFormat
 	avcodec_alloc_frame() -> av_frame_alloc()
 	PIX_FMT_BGRA -> AV_PIX_FMT_BGRA
 	PIX_FMT_YUVJ420P -> AV_PIX_FMT_YUV420P
 	CODEC_ID_AAC -> AV_CODEC_ID_AAC
-	avcodec_encode_video -> avcodec_encode_video2
+	avcodec_encode_video -> avcodec_encode_video2 -> avcodec_send_frame
+	avcodec_encode_audio2 -> avcodec_send_frame
+	av_free_packet -> av_packet_unref
 */
 
 int size_picture(AVPixelFormat pix_fmt, int width, int height, int linesize[AV_NUM_DATA_POINTERS])
@@ -167,9 +169,9 @@ void write_audio_frame(AVFormatContext *oc, AVStream *st, void *asamples, int co
 	AVCodecContext *c;
 	AVPacket pkt = { 0 }; // data and size must be 0;
 	AVFrame *frame = av_frame_alloc();
-	int got_packet;
 	uint16_t *audsamples;
 	int num;
+	int ret;
 
 	audsamples = (uint16_t *)asamples;
 	av_init_packet(&pkt);
@@ -196,26 +198,32 @@ void write_audio_frame(AVFormatContext *oc, AVStream *st, void *asamples, int co
 				av_get_bytes_per_sample(c->sample_fmt) *
 				c->channels, 1);
 
-			avcodec_encode_audio2(c, &pkt, frame, &got_packet);
-			if (got_packet) {
-				pkt.stream_index = st->index;
-
-				if (pkt.pts != AV_NOPTS_VALUE)
-					pkt.pts = av_rescale_q(pkt.pts, st->codec->time_base, st->time_base);
-				else
-					pkt.pts = av_rescale_q(videofile.audio_duration, st->codec->time_base, st->time_base);
-				if (pkt.duration > 0)
+			ret = avcodec_send_frame(c, frame);
+			if (ret >= 0)
+			{
+				ret = avcodec_receive_packet(c, &pkt);
+				if (ret == 0)
 				{
-					videofile.audio_duration += pkt.duration;
-					pkt.duration = (int)av_rescale_q(pkt.duration, st->codec->time_base, st->time_base);
-				}
+					pkt.stream_index = st->index;
 
-				/* Write the compressed frame to the media file. */
-				if (av_interleaved_write_frame(oc, &pkt) != 0) {
-					fprintf(stderr, "Error while writing audio frame\n");
-					exit(1);
+					if (pkt.pts != AV_NOPTS_VALUE)
+						pkt.pts = av_rescale_q(pkt.pts, st->codec->time_base, st->time_base);
+					else
+						pkt.pts = av_rescale_q(videofile.audio_duration, st->codec->time_base, st->time_base);
+					pkt.dts = pkt.pts;
+					if (pkt.duration > 0)
+					{
+						videofile.audio_duration += pkt.duration;
+						pkt.duration = (int)av_rescale_q(pkt.duration, st->codec->time_base, st->time_base);
+					}
+
+					/* Write the compressed frame to the media file. */
+					if (av_interleaved_write_frame(oc, &pkt) != 0) {
+						fprintf(stderr, "Error while writing audio frame\n");
+						exit(1);
+					}
+					av_packet_unref(&pkt);
 				}
-				av_free_packet(&pkt);
 			}
 		}
 	}
@@ -225,7 +233,6 @@ void write_video_frame(AVFormatContext *oc, AVStream *st)
 {
 	int ret;
 	AVCodecContext *c;
-	uint8_t *old;
 
 	c = st->codec;
 
@@ -246,29 +253,26 @@ void write_video_frame(AVFormatContext *oc, AVStream *st)
 		ret = av_interleaved_write_frame(oc, &pkt);
 	}
 	else {
-		int got_packet;
 		AVPacket pkt = { 0 };
 
 		// in a second there are fps frames and dsss tics
 		// pts=frame_number*tics/fps -> tics=1/rate
 		pics.compress->pts = videofile.written_frames_count * c->time_base.den / STREAM_FRAME_RATE;
 		/* encode the image */
-		ret = avcodec_encode_video2(c, &pkt, pics.compress, &got_packet);
-		/* If size is zero, it means the image was buffered. */
-		if (ret >= 0) {
-			if (got_packet != 0)
+		ret = avcodec_send_frame(c, pics.compress);
+		if (ret >= 0)
+		{
+			ret = avcodec_receive_packet(c, &pkt);
+			if (ret == 0)
 			{
-				if (c->coded_frame->pts != AV_NOPTS_VALUE)
-					pkt.pts = av_rescale_q(c->coded_frame->pts,
-						c->time_base, st->time_base);
-				if (c->coded_frame->key_frame)
-					pkt.flags |= AV_PKT_FLAG_KEY;
 				pkt.stream_index = st->index;
 
 				/* Write the compressed frame to the media file. */
 				ret = av_interleaved_write_frame(oc, &pkt);
-				av_free_packet(&pkt);
+				av_packet_unref(&pkt);
 			}
+			else if (ret == AVERROR(EAGAIN))
+				ret = 0;
 		}
 	}
 	if (ret != 0) {
@@ -290,6 +294,8 @@ void open_audio(AVFormatContext *oc, AVStream *st)
 		exit(1);
 	}
 
+	st->time_base.den = c->time_base.den;
+	st->time_base.num = c->time_base.num;
 	if (c->codec->capabilities & CODEC_CAP_VARIABLE_FRAME_SIZE)
 		videofile.audio_input_frame_size = 10000;
 	else
@@ -420,6 +426,8 @@ AVStream *add_video_stream(AVFormatContext *oc, AVCodecID codec_id, int width, i
 	* identical to 1. */
 	c->time_base.den = STREAM_FRAME_RATE;
 	c->time_base.num = 1;
+	st->time_base.den = c->time_base.den;
+	st->time_base.num = c->time_base.num;
 	c->gop_size = 12; /* emit one intra frame every twelve frames at most */
 	c->pix_fmt = AV_PIX_FMT_YUV420P;
 	if (c->codec_id == AV_CODEC_ID_MPEG2VIDEO) {
@@ -443,36 +451,37 @@ AVStream *add_video_stream(AVFormatContext *oc, AVCodecID codec_id, int width, i
 void flush_audio_codec(AVFormatContext *oc, AVStream *st)
 {
 	AVCodecContext *c;
-	int got_packet;
+	int ret;
 
 	c = st->codec;
 
+	ret = avcodec_send_frame(c, nullptr);
 	while (true)
 	{
 		AVPacket pkt = { 0 };
 
 		av_init_packet(&pkt);
-		avcodec_encode_audio2(c, &pkt, NULL, &got_packet);
-		if (got_packet == 0)
-			return;
-
-		pkt.stream_index = st->index;
-		if (pkt.pts != AV_NOPTS_VALUE)
-			pkt.pts = av_rescale_q(pkt.pts, st->codec->time_base, st->time_base);
-		else
-			pkt.pts = av_rescale_q(videofile.audio_duration, st->codec->time_base, st->time_base);
-		if (pkt.duration > 0)
+		ret = avcodec_receive_packet(c, &pkt);
+		if (ret == 0)
 		{
-			videofile.audio_duration += pkt.duration;
-			pkt.duration = (int)av_rescale_q(pkt.duration, st->codec->time_base, st->time_base);
+			pkt.stream_index = st->index;
+			if (pkt.pts != AV_NOPTS_VALUE)
+				pkt.pts = av_rescale_q(pkt.pts, st->codec->time_base, st->time_base);
+			else
+				pkt.pts = av_rescale_q(videofile.audio_duration, st->codec->time_base, st->time_base);
+			pkt.dts = pkt.pts;
+			if (pkt.duration > 0)
+			{
+				videofile.audio_duration += pkt.duration;
+				pkt.duration = (int)av_rescale_q(pkt.duration, st->codec->time_base, st->time_base);
+			}
+			ret = av_interleaved_write_frame(oc, &pkt);
+			av_packet_unref(&pkt);
+			if (ret != 0)
+				break;
 		}
-
-		/* Write the compressed frame to the media file. */
-		if (av_interleaved_write_frame(oc, &pkt) != 0) {
-			fprintf(stderr, "Error while writing audio frame\n");
-			exit(1);
-		}
-		av_free_packet(&pkt);
+		else
+			break;
 	}
 }
 
@@ -480,24 +489,25 @@ void flush_video_codec(AVFormatContext *oc, AVStream *st)
 {
 	int ret;
 	AVCodecContext *c;
-	int got_packet;
 
 	c = st->codec;
 
+	ret = avcodec_send_frame(c, nullptr);
 	while (true)
 	{
 		AVPacket pkt = { 0 };
 
-		ret = avcodec_encode_video2(c, &pkt, NULL, &got_packet);
-		if (got_packet == 0)
+		ret = avcodec_receive_packet(c, &pkt);
+		if (ret == 0)
+		{
+			pkt.stream_index = st->index;
+			ret = av_interleaved_write_frame(oc, &pkt);
+			av_packet_unref(&pkt);
+			if (ret != 0)
+				break;
+		}
+		else 
 			break;
-		if (c->coded_frame->key_frame)
-			pkt.flags |= AV_PKT_FLAG_KEY;
-		pkt.stream_index = st->index;
-
-		/* Write the compressed frame to the media file. */
-		ret = av_interleaved_write_frame(oc, &pkt);
-		av_free_packet(&pkt);
 	}
 }
 
@@ -544,10 +554,6 @@ int open_video_file(char *filename, int width, int height)
 
 	/* Add the audio and video streams using the default format codecs
 	* and initialize the codecs. */
-	/* Not needed with libav 12 */
-	//videofile.fmt->audio_codec = AV_CODEC_ID_AAC;
-	//videofile.fmt->video_codec = AV_CODEC_ID_H264;
-
 	videofile.video_st = NULL;
 	videofile.audio_st = NULL;
 	if (videofile.fmt->video_codec != AV_CODEC_ID_NONE) {
