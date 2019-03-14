@@ -46,6 +46,7 @@ struct {
 	int samplescodec_size[AV_NUM_DATA_POINTERS];
 	AVAudioResampleContext *acontext;
 	int64_t audio_duration;
+	AVFormatContext *oc_rtmp;
 } videofile;
 
 void set_default_parameters()
@@ -164,6 +165,76 @@ void clear_picture(AVFrame *picture)
 	}
 }
 
+int packet_rtmp(AVStream *st, AVPacket *pkt)
+{
+	AVPacket *pktr = av_packet_clone(pkt);
+	AVStream *ost;
+	int ret;
+
+	ost = videofile.oc_rtmp->streams[st->index];
+	pktr->pts = av_rescale_q_rnd(pkt->pts, st->time_base, ost->time_base, AV_ROUND_NEAR_INF);
+	pktr->dts = av_rescale_q_rnd(pkt->dts, st->time_base, ost->time_base, AV_ROUND_NEAR_INF);
+	pktr->duration = av_rescale_q(pkt->duration, st->time_base, ost->time_base);
+	ret = av_interleaved_write_frame(videofile.oc_rtmp, pktr);
+	av_packet_unref(pktr);
+	return ret;
+}
+
+// avconv -re -i file.mp4 -vcodec copy -acodec copy -f flv rtmp://website.com/live2/secet_key
+void initialize_rtmp(char *url)
+{
+	AVOutputFormat *oformat;
+	AVFormatContext *ofmt_ctx = avformat_alloc_context();
+
+	oformat = av_guess_format("flv", NULL, NULL);
+	if (!oformat)
+	{
+		printf("Output format flv is not a suitable output format\n\r");
+		exit(1);
+	}
+	ofmt_ctx->oformat = oformat;
+	if (url)
+		strncpy_s(ofmt_ctx->filename, sizeof(ofmt_ctx->filename), url, sizeof(ofmt_ctx->filename));
+
+	AVFormatContext *ifmt_ctx = videofile.oc;
+
+	for (int i = 0; i < ifmt_ctx->nb_streams; i++) {
+		//Create output AVStream according to input AVStream
+		AVStream *in_stream = ifmt_ctx->streams[i];
+		AVStream *out_stream = avformat_new_stream(ofmt_ctx, in_stream->codec->codec);
+		if (!out_stream) {
+			printf("Failed allocating output stream\n\r");
+			exit(1);
+		}
+		//Copy the settings of AVCodecContext
+		if (avcodec_copy_context(out_stream->codec, in_stream->codec) < 0) {
+			printf("Failed to copy context from input to output stream codec context\n");
+			exit(1);
+		}
+		out_stream->time_base.den = out_stream->codec->time_base.den;
+		out_stream->time_base.num = out_stream->codec->time_base.num;
+		out_stream->codec->codec_tag = 0;
+		if (ofmt_ctx->oformat->flags & AVFMT_GLOBALHEADER)
+			out_stream->codec->flags |= CODEC_FLAG_GLOBAL_HEADER;
+	}
+
+	//Dump Format
+	av_dump_format(ofmt_ctx, 0, url, 1);
+	//Open output URL
+	if (!(ofmt_ctx->oformat->flags & AVFMT_NOFILE)) {
+		if (avio_open(&ofmt_ctx->pb, url, AVIO_FLAG_WRITE) < 0) {
+			printf("Could not open output URL '%s'", url);
+			exit(1);
+		}
+	}
+	if (avformat_write_header(ofmt_ctx, NULL) < 0)
+	{
+		printf("Error occurred when opening output URL\n");
+		exit(1);
+	}
+	videofile.oc_rtmp = ofmt_ctx;
+}
+
 void write_audio_frame(AVFormatContext *oc, AVStream *st, void *asamples, int count)
 {
 	AVCodecContext *c;
@@ -217,6 +288,8 @@ void write_audio_frame(AVFormatContext *oc, AVStream *st, void *asamples, int co
 						pkt.duration = (int)av_rescale_q(pkt.duration, st->codec->time_base, st->time_base);
 					}
 
+					if (videofile.oc_rtmp)
+						packet_rtmp(st, &pkt);
 					/* Write the compressed frame to the media file. */
 					if (av_interleaved_write_frame(oc, &pkt) != 0) {
 						fprintf(stderr, "Error while writing audio frame\n");
@@ -267,6 +340,8 @@ void write_video_frame(AVFormatContext *oc, AVStream *st)
 			{
 				pkt.stream_index = st->index;
 
+				if (videofile.oc_rtmp)
+					packet_rtmp(st, &pkt);
 				/* Write the compressed frame to the media file. */
 				ret = av_interleaved_write_frame(oc, &pkt);
 				av_packet_unref(&pkt);
@@ -665,7 +740,31 @@ int main(int argc, char *argv[])
 				n++;
 				if (n < argc)
 				{
-					parameters.url = argv[n];
+					int l = strlen(argv[n]);
+
+					if (l > 0)
+					{
+						if (argv[n][l - 1] == '/')
+						{
+							int l2;
+							char *buf;
+							char *tmp = new char[128];
+
+							printf("Please enter secret key: ");
+							gets_s(tmp, 127);
+							l2 = strlen(tmp);
+							if (l2 > 0)
+							{
+								buf = new char[l+l2+1];
+								strcpy(buf, argv[n]);
+								strcat(buf, tmp);
+								parameters.url = buf;
+								delete[] tmp;
+							}
+						}
+						else
+							parameters.url = argv[n];
+					}
 				}
 			}
 			else if (strcmp(argv[n], "-m") == 0)
@@ -690,6 +789,7 @@ int main(int argc, char *argv[])
 	QueryPerformanceFrequency(&performance_frequency);
 	/* Initialize libavcodec, and register all codecs and formats. */
 	av_register_all();
+	avformat_network_init();
 #ifdef _DEBUG
 	debug_list_codecs();
 	debug_list_formats();
@@ -699,6 +799,7 @@ int main(int argc, char *argv[])
 	pics.context = sws_getContext(pics.generated->width, pics.generated->height, AV_PIX_FMT_BGRA, pics.compress->width, pics.compress->height, AV_PIX_FMT_YUV420P, SWS_BILINEAR, NULL, NULL, NULL);
 	if (open_video_file(parameters.filename, 1280, 720) == 0)
 	{
+		initialize_rtmp(parameters.url);
 		audio_silent = new uint16_t[AUDIO_SAMPLE_RATE / STREAM_FRAME_RATE];
 		memset(audio_silent, 0, 2 * AUDIO_SAMPLE_RATE / STREAM_FRAME_RATE);
 		QueryPerformanceCounter(&start_time);
@@ -717,7 +818,8 @@ int main(int argc, char *argv[])
 				QueryPerformanceCounter(&current_time);
 				timems = (int)(((current_time.QuadPart - start_time.QuadPart) * (LONGLONG)1000) / performance_frequency.QuadPart);
 				timems = ((n + 1) * 1000) / STREAM_FRAME_RATE - timems;
-				Sleep(timems);
+				if (timems > 0)
+					Sleep(timems);
 			}
 		}
 		QueryPerformanceCounter(&end_time);
