@@ -53,8 +53,8 @@ void set_default_parameters()
 {
 	parameters.filename = new char[11];
 	strcpy_s(parameters.filename, 11, "output.mp4");
-	parameters.url = new char[8];
-	strcpy_s(parameters.url, 8, "rtmp://");
+	parameters.url = new char[1];
+	parameters.url[0] = 0; // rtmp://...
 	parameters.minutes = 1;
 	parameters.realtime = false;
 }
@@ -235,6 +235,23 @@ void initialize_rtmp(char *url)
 	videofile.oc_rtmp = ofmt_ctx;
 }
 
+void deinitialize_rtmp()
+{
+	if (videofile.oc_rtmp)
+	{
+		av_write_trailer(videofile.oc_rtmp);
+
+		for (int i = 0; i < videofile.oc_rtmp->nb_streams; i++) {
+			av_freep(&videofile.oc_rtmp->streams[i]);
+		}
+
+		if (!(videofile.oc_rtmp->oformat->flags & AVFMT_NOFILE)) {
+			avio_close(videofile.oc_rtmp->pb);
+		}
+		av_free(videofile.oc);
+	}
+}
+
 void write_audio_frame(AVFormatContext *oc, AVStream *st, void *asamples, int count)
 {
 	AVCodecContext *c;
@@ -360,6 +377,7 @@ void write_video_frame(AVFormatContext *oc, AVStream *st)
 void open_audio(AVFormatContext *oc, AVStream *st)
 {
 	AVCodecContext *c;
+	int err;
 
 	c = st->codec;
 
@@ -379,6 +397,13 @@ void open_audio(AVFormatContext *oc, AVStream *st)
 	av_samples_alloc(videofile.samplescodec, videofile.samplescodec_size, c->channels, videofile.audio_input_frame_size, c->sample_fmt, 0);
 	videofile.samples_used = 0;
 	videofile.audio_duration = 0;
+
+	/* copy the stream parameters to the muxer */
+	err = avcodec_parameters_from_context(st->codecpar, c);
+	if (err < 0) {
+		fprintf(stderr, "Could not copy the stream parameters\n");
+		exit(1);
+	}
 }
 
 static void open_video(AVFormatContext *oc, AVStream *st)
@@ -404,6 +429,13 @@ static void open_video(AVFormatContext *oc, AVStream *st)
 		* allocated with av_malloc). */
 		videofile.video_outbuf_size = 200000;
 		videofile.video_outbuf = (uint8_t *)av_malloc(videofile.video_outbuf_size);
+	}
+
+	/* copy the stream parameters to the muxer */
+	err = avcodec_parameters_from_context(st->codecpar, c);
+	if (err < 0) {
+		fprintf(stderr, "Could not copy the stream parameters\n");
+		exit(1);
 	}
 }
 
@@ -489,6 +521,7 @@ AVStream *add_video_stream(AVFormatContext *oc, AVCodecID codec_id, int width, i
 	}
 
 	c = st->codec;
+	c->codec_id = codec->id;
 
 	/* Put sample parameters. */
 	c->bit_rate = 1000000;
@@ -505,16 +538,14 @@ AVStream *add_video_stream(AVFormatContext *oc, AVCodecID codec_id, int width, i
 	st->time_base.num = c->time_base.num;
 	c->gop_size = 12; /* emit one intra frame every twelve frames at most */
 	c->pix_fmt = AV_PIX_FMT_YUV420P;
-	if (c->codec_id == AV_CODEC_ID_MPEG2VIDEO) {
-		/* just for testing, we also add B frames */
-		c->max_b_frames = 2;
-	}
-	if (c->codec_id == AV_CODEC_ID_MPEG1VIDEO) {
+	/* just for testing, disable B frames */
+	c->max_b_frames = 0;
+	//if (c->codec_id == AV_CODEC_ID_MPEG1VIDEO) {
 		/* Needed to avoid using macroblocks in which some coeffs overflow.
 		* This does not happen with normal video, it just happens here as
 		* the motion of the chroma plane does not match the luma plane. */
-		c->mb_decision = 2;
-	}
+	//	c->mb_decision = 2;
+	//}
 	/* Some formats want stream headers to be separate. */
 	if (oc->oformat->flags & AVFMT_GLOBALHEADER)
 		c->flags |= CODEC_FLAG_GLOBAL_HEADER;
@@ -799,7 +830,8 @@ int main(int argc, char *argv[])
 	pics.context = sws_getContext(pics.generated->width, pics.generated->height, AV_PIX_FMT_BGRA, pics.compress->width, pics.compress->height, AV_PIX_FMT_YUV420P, SWS_BILINEAR, NULL, NULL, NULL);
 	if (open_video_file(parameters.filename, 1280, 720) == 0)
 	{
-		initialize_rtmp(parameters.url);
+		if (parameters.url[0] != 0)
+			initialize_rtmp(parameters.url);
 		audio_silent = new uint16_t[AUDIO_SAMPLE_RATE / STREAM_FRAME_RATE];
 		memset(audio_silent, 0, 2 * AUDIO_SAMPLE_RATE / STREAM_FRAME_RATE);
 		QueryPerformanceCounter(&start_time);
@@ -809,7 +841,7 @@ int main(int argc, char *argv[])
 			int x;
 
 			clear_picture(pics.generated);
-			x = value_width((1280 - n) / 2);
+			x = (1280 - value_width(n)) / 2;
 			value_draw_argb(pics.generated->data[0], x, 253, pics.generated->linesize[0], n);
 			write_video_frame(videofile.oc, videofile.video_st);
 			write_audio_frame(videofile.oc, videofile.audio_st, audio_silent, AUDIO_SAMPLE_RATE / STREAM_FRAME_RATE);
@@ -824,6 +856,7 @@ int main(int argc, char *argv[])
 		}
 		QueryPerformanceCounter(&end_time);
 		close_video_file();
+		deinitialize_rtmp();
 		timems = (int)(((end_time.QuadPart - start_time.QuadPart) * (LONGLONG)1000) / performance_frequency.QuadPart);
 		printf("Generating %d frames took %d msec (%d sec)\n\r", n, timems, timems / 1000);
 	}
