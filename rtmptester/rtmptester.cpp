@@ -47,6 +47,7 @@ struct {
 	AVAudioResampleContext *acontext;
 	int64_t audio_duration;
 	AVFormatContext *oc_rtmp;
+	uint16_t *audio_silent;
 } videofile;
 
 void set_default_parameters()
@@ -198,7 +199,7 @@ void initialize_rtmp(char *url)
 
 	AVFormatContext *ifmt_ctx = videofile.oc;
 
-	for (int i = 0; i < ifmt_ctx->nb_streams; i++) {
+	for (unsigned int i = 0; i < ifmt_ctx->nb_streams; i++) {
 		//Create output AVStream according to input AVStream
 		AVStream *in_stream = ifmt_ctx->streams[i];
 		AVStream *out_stream = avformat_new_stream(ofmt_ctx, in_stream->codec->codec);
@@ -241,20 +242,21 @@ void deinitialize_rtmp()
 	{
 		av_write_trailer(videofile.oc_rtmp);
 
-		for (int i = 0; i < videofile.oc_rtmp->nb_streams; i++) {
-			av_freep(&videofile.oc_rtmp->streams[i]);
-		}
-
 		if (!(videofile.oc_rtmp->oformat->flags & AVFMT_NOFILE)) {
 			avio_close(videofile.oc_rtmp->pb);
 		}
-		av_free(videofile.oc);
+		for (unsigned int i = 0; i < videofile.oc_rtmp->nb_streams; i++) {
+			av_freep(&videofile.oc_rtmp->streams[i]);
+		}
+		av_free(videofile.oc_rtmp);
 	}
 }
 
-void write_audio_frame(AVFormatContext *oc, AVStream *st, void *asamples, int count)
+void write_audio_frame(void *asamples, int count)
 {
 	AVCodecContext *c;
+	AVFormatContext *oc = videofile.oc;
+	AVStream *st = videofile.audio_st;
 	AVPacket pkt = { 0 }; // data and size must be 0;
 	AVFrame *frame = av_frame_alloc();
 	uint16_t *audsamples;
@@ -319,10 +321,17 @@ void write_audio_frame(AVFormatContext *oc, AVStream *st, void *asamples, int co
 	}
 }
 
-void write_video_frame(AVFormatContext *oc, AVStream *st)
+void write_audio_frame_zero()
+{
+	write_audio_frame(videofile.audio_silent, AUDIO_SAMPLE_RATE / STREAM_FRAME_RATE);
+}
+
+void write_video_frame()
 {
 	int ret;
 	AVCodecContext *c;
+	AVFormatContext *oc = videofile.oc;
+	AVStream *st = videofile.video_st;
 
 	c = st->codec;
 
@@ -739,7 +748,6 @@ int main(int argc, char *argv[])
 	LARGE_INTEGER end_time;
 	int timems;
 	int n;
-	uint16_t *audio_silent;
 
 	set_default_parameters();
 	if (argc > 0)
@@ -771,13 +779,13 @@ int main(int argc, char *argv[])
 				n++;
 				if (n < argc)
 				{
-					int l = strlen(argv[n]);
+					size_t l = strlen(argv[n]);
 
 					if (l > 0)
 					{
 						if (argv[n][l - 1] == '/')
 						{
-							int l2;
+							size_t l2;
 							char *buf;
 							char *tmp = new char[128];
 
@@ -786,9 +794,9 @@ int main(int argc, char *argv[])
 							l2 = strlen(tmp);
 							if (l2 > 0)
 							{
-								buf = new char[l+l2+1];
-								strcpy(buf, argv[n]);
-								strcat(buf, tmp);
+								buf = new char[l + l2 + 1];
+								strcpy_s(buf, l + l2, argv[n]);
+								strcat_s(buf, l + l2 + 1, tmp);
 								parameters.url = buf;
 								delete[] tmp;
 							}
@@ -832,8 +840,9 @@ int main(int argc, char *argv[])
 	{
 		if (parameters.url[0] != 0)
 			initialize_rtmp(parameters.url);
-		audio_silent = new uint16_t[AUDIO_SAMPLE_RATE / STREAM_FRAME_RATE];
-		memset(audio_silent, 0, 2 * AUDIO_SAMPLE_RATE / STREAM_FRAME_RATE);
+		videofile.audio_silent = new uint16_t[AUDIO_SAMPLE_RATE / STREAM_FRAME_RATE];
+		memset(videofile.audio_silent, 0, 2 * AUDIO_SAMPLE_RATE / STREAM_FRAME_RATE);
+		printf("\n\r");
 		QueryPerformanceCounter(&start_time);
 		for (n = 0; n < parameters.minutes * 60 * STREAM_FRAME_RATE; n++)
 		{
@@ -843,8 +852,19 @@ int main(int argc, char *argv[])
 			clear_picture(pics.generated);
 			x = (1280 - value_width(n)) / 2;
 			value_draw_argb(pics.generated->data[0], x, 253, pics.generated->linesize[0], n);
-			write_video_frame(videofile.oc, videofile.video_st);
-			write_audio_frame(videofile.oc, videofile.audio_st, audio_silent, AUDIO_SAMPLE_RATE / STREAM_FRAME_RATE);
+			write_video_frame();
+			write_audio_frame_zero();
+			if ((n % STREAM_FRAME_RATE) == 0)
+			{
+				int h, m, s;
+
+				s = n / STREAM_FRAME_RATE;
+				h = s / 3600;
+				s = s - h * 3600;
+				m = s / 60;
+				s = s - m * 60;
+				printf("%02d:%02d:%02d\r",h,m,s);
+			}
 			if (parameters.realtime)
 			{
 				QueryPerformanceCounter(&current_time);
@@ -858,7 +878,7 @@ int main(int argc, char *argv[])
 		close_video_file();
 		deinitialize_rtmp();
 		timems = (int)(((end_time.QuadPart - start_time.QuadPart) * (LONGLONG)1000) / performance_frequency.QuadPart);
-		printf("Generating %d frames took %d msec (%d sec)\n\r", n, timems, timems / 1000);
+		printf("\nGenerating %d frames took %d msec (%d sec)\n\r", n, timems, timems / 1000);
 	}
 	return 0;
 }
