@@ -259,11 +259,12 @@ void write_audio_frame(void *asamples, int count)
 	AVStream *st = videofile.audio_st;
 	AVPacket pkt = { 0 }; // data and size must be 0;
 	AVFrame *frame = av_frame_alloc();
-	uint16_t *audsamples;
+	int16_t *audsamples;
 	int num;
 	int ret;
+	int size;
 
-	audsamples = (uint16_t *)asamples;
+	audsamples = (int16_t *)asamples;
 	av_init_packet(&pkt);
 	c = st->codec;
 
@@ -282,11 +283,10 @@ void write_audio_frame(void *asamples, int count)
 
 			videofile.samples_used = 0;
 			frame->nb_samples = videofile.audio_input_frame_size;
+			size = av_samples_get_buffer_size(NULL, c->channels, c->frame_size, c->sample_fmt, 1);
 			avcodec_fill_audio_frame(frame, c->channels, c->sample_fmt,
 				videofile.samplescodec[0],
-				videofile.audio_input_frame_size *
-				av_get_bytes_per_sample(c->sample_fmt) *
-				c->channels, 1);
+				size, 1);
 
 			ret = avcodec_send_frame(c, frame);
 			if (ret >= 0)
